@@ -1,7 +1,9 @@
+#include <cstdio>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 #include <exception>
 #include <stdexcept>
@@ -12,8 +14,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #define FUSE_USE_VERSION 28
-#include <fuse.h>
-#include <fuse/fuse_lowlevel.h>
+#include "myfuse.h"
+#include "myfuse/fuse_lowlevel.h"
+#include <string.h>
 #include "reddnet.h"
 
 
@@ -35,9 +38,9 @@ pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void * generate_filehandle( unsigned long inode );
 void destroy_filehandle( void * fh );
-off_t get_offset( void * fh );
-void set_offset( void * fh , off_t offset);
-unsigned long get_inode( void * fh );
+uint64_t get_offset( void * fh );
+void set_offset( void * fh , uint64_t offset);
+uint64_t get_inode( void * fh );
 struct fuse_file_info generate_fileinfo( void * fh );
 int init_request( request_t * request_object );
 response_t  wait_request( request_t * request_object, int * return_code );
@@ -57,7 +60,7 @@ int redd_init() {
 	// we'll dlopen() them so they don't need to be brought along with cmssw
 	// if you're running ReDDNet at your site, you will have the libs anyway
 	library_handle =
-	     dlopen("/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/lib/libjfuselib.dylib", RTLD_LAZY);
+	     dlopen("/home/meloam/bfs-jars/lib/libjfuselib.so", RTLD_LAZY);
 	if (library_handle == NULL) {
 		throw_redd_error(std::string("The ReddNet libraries can't be found: ") +
 							dlerror());
@@ -156,11 +159,11 @@ int redd_term() {
 // Accessors for error codes
 //
 
-long redd_errno(){
+int32_t redd_errno(){
 	return private_redd_errno;
 }
 
-const std::string & redd_strerror(long unused){
+const std::string & redd_strerror() {
 	return private_redd_errstr;
 }
 
@@ -175,31 +178,38 @@ void * redd_open (const char * name,int openflags,int perms) {
 	std::string name_string( name );
 	request_t request_object;
 	response_t response;
-	unsigned long inode = 1;
+    fuse_ino_t inode = 1;
 	int slash_pos = 0;
 	bool keep_going = true;
-
+	std::cout << "BFS: opening " << name << std::endl;
 	// have to walk up the directory path to get the inode of the target
 
 	// TODO: need to handle relative addresses. Not even sure of how that works
 	// for now, we need to make sure to eat a leading slash if it's there, but assume
 	// the path is absolute for now
-	if ( name_string[0] == '/' ) {
-		slash_pos = 1;
-	}
+//	if ( name_string[0] == '/' ) {
+//		slash_pos = 1;
+//	}
 
 	while (keep_going) {
-		size_t next_slash = name_string.find("/", slash_pos);
+		slash_pos++;
+		size_t next_slash = name_string.find('/',slash_pos+1);
 		if ( next_slash == std::string::npos ) {
 			keep_going = false;
 			break;
 		}
+		std::cout << "BFS: Looking at directory '" << name_string.substr(slash_pos,next_slash - slash_pos) << "'\n";
+		if ( (next_slash - slash_pos) == 1 ) {
+			// we ended up with two slashes right next to each other some//file/name
+			slash_pos = next_slash;
+			continue;
+		}
 		init_request( &request_object );
-		const char * substr = name_string.substr( slash_pos + 1, next_slash - slash_pos -1 ).c_str();
+		std::string current_directory = name_string.substr( slash_pos+1, next_slash - slash_pos -1 );
+		std::cout << "BFS: substr is '" << current_directory << "'\n";
 		(ops_table->lookup)( (fuse_req_t) &request_object, 
 					inode, 
-					(name_string.substr( slash_pos + 1, next_slash - slash_pos - 1 ).c_str())
-				);
+					current_directory.c_str());
 		response = wait_request( &request_object, &return_code );
 		// error handling
 		if (return_code && (response.error_number != ENOENT)) {
@@ -230,20 +240,24 @@ void * redd_open (const char * name,int openflags,int perms) {
 	}
 
 	// we've searched the directories, now see if the actual file exists
+	printf("+we've searched the directories, now see if the actual file exists\n");
 	init_request( &request_object );
 	(ops_table->lookup)( (fuse_req_t) &request_object, 
 				inode, 
 				(name_string.substr( slash_pos ).c_str()));
 	response = wait_request( &request_object, &return_code );
+	printf("-we've searched the directories, now see if the actual file exists\n");
 	if (return_code && (response.error_number != ENOENT)) {
 		return NULL;
 	}
 	
 	void * fh;
-	printf("Looking for inodes\n");
+	printf("Attempting to open\n");
 	if ( response.entry.ino != 0 ) {
 		// we have the inode, open it
+		printf("    Inode is %lld %llu\n", response.entry.ino, response.entry.ino);
 		inode = response.entry.ino;
+		printf("    Inode is %lld %llu\n", inode, inode);
 		init_request( &request_object );
 		fh = generate_filehandle( inode );
 		struct fuse_file_info fi;
@@ -253,6 +267,7 @@ void * redd_open (const char * name,int openflags,int perms) {
 						inode,
 						&fi);
 		wait_request( &request_object, &return_code );
+		((filehandle_t *) fh)->inode = inode;
 		// error handling
 		if (return_code) { return NULL; }
 	} else if ( ( response.entry.ino == 0 ) &&
@@ -297,11 +312,14 @@ ssize_t redd_read(void * fh, char * buf, ssize_t num) {
 	init_request( &request_object );
 	request_object.target_size = num;
 	request_object.target = buf;
+	std::cout << "BFS: reading from inode " << get_inode(fh) << " and offset " << get_offset(fh) << "\n";
 	(*ops_table->read)( (fuse_req_t) &request_object, get_inode(fh), num, get_offset(fh), &fi );
 	response_t response = wait_request( &request_object, &return_code );
 	// error handling
 	if (return_code) { return -1; }
-	set_offset( fh, response.buffer_length );
+	std::cout << "Got a supposed buffer length of " << response.buffer_length << " and pre offset of " << get_offset(fh) << "\n";
+	set_offset( fh, get_offset(fh) + response.buffer_length );
+	std::cout << "post offset is " << get_offset(fh) << "\n";	
 	return response.buffer_length;
 }
 
@@ -328,10 +346,10 @@ int redd_close(void * fh) {
 // Seeks to a position in the file
 // returns -1 on error
 
-off_t redd_lseek( void * fh, off_t offset, int which ) {
+off_t redd_lseek( void * fh, off_t offset, uint32_t which ) {
 	clear_errors();
 	int return_code = 0;
-
+	std::cout << "seeking\n";
 	// need to get the filesize to do some sanity checking
 	request_t request_object;
 	struct fuse_file_info fi = generate_fileinfo( fh );
@@ -401,11 +419,16 @@ int init_request( request_t * request_object ) {
 response_t  wait_request( request_t * request_object, int * return_code ) {
 	// wait for the reply to come back
 	(*return_code) = 0;
+	ssize_t read_bytes;
 	response_t response;
-	if ( read( request_object->fd[0], (char *) &response, sizeof(response_t) ) 
-			!= sizeof(response_t) ) {
+	
+	read_bytes = 
+	read( request_object->fd[0], (char *) &response, sizeof(response_t) );
+	
+	if (read_bytes != sizeof(response_t) ) {
 		(*return_code) = 1;
-		throw_redd_error("Error in response, got a short read. Might be due to shutdown");
+		printf("Got %i wanted %i bytes\n", read_bytes, sizeof(response_t) );
+		throw_redd_error("Error in response, got a short read. Might be due to shutdown ");
 		return response;
 	}
 
@@ -413,29 +436,7 @@ response_t  wait_request( request_t * request_object, int * return_code ) {
 	if ( response.is_error ) {
 		(*return_code) = 1;
 		// FIXME: SUPER non-threadsafe
-		throw_redd_error(std::string("Error in reddnet response") + strerror(response.error_number));
-	}
-
-	// pull out any string information
-	if ( ( response.buffer_length != 0   ) &&
-		 ( request_object->target != NULL ) &&
-		 ( request_object->target_size !=0 ) ){
-		ssize_t read_bytes = 
-			read( request_object->fd[0], request_object->target, 
-				(response.buffer_length < request_object->target_size) ?
-					response.buffer_length :
-					request_object->target_size);
-		if ( read_bytes < response.buffer_length ) {
-			throw_redd_error("Less data was in the pipe than we were told", errno);
-			(*return_code) = 1;
-			return response;
-		}
-		
-		if ( read_bytes < 0 ) {
-			throw_redd_error("Error reading back bytestring from reddnet", errno);
-			(*return_code) = 1;
-			return response;
-		}
+		throw_redd_error(std::string("Error in reddnet response ") + strerror(response.error_number));
 	}
 	// get some cleanup
 	close( request_object->fd[0] );
@@ -464,17 +465,17 @@ void destroy_filehandle( void * fh ) {
 }
 
 
-off_t get_offset( void * fh ){
+uint64_t get_offset( void * fh ){
 	return ((filehandle_t *) fh)->offset;
 }
 
 
-void set_offset( void * fh , off_t offset) {
-	((filehandle_t *) fh)->offset += offset;
+void set_offset( void * fh , uint64_t offset) {
+	((filehandle_t *) fh)->offset = offset;
 }
 
 
-unsigned long get_inode( void * fh ) {
+uint64_t get_inode( void * fh ) {
 	return ((filehandle_t *) fh)->inode;
 }
 

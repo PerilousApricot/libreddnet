@@ -1,8 +1,8 @@
 #define FUSE_USE_VERSION 28
 #include <pthread.h>
 #include <stdlib.h>
-#include <fuse.h>
-#include <fuse/fuse_lowlevel.h>
+#include "myfuse.h"
+#include "myfuse/fuse_lowlevel.h"
 #include <reddnet.h>
 #include <unistd.h>
 #include <errno.h>
@@ -11,14 +11,19 @@
 #include <jni.h>
 
 
-#define LIBPATH   "./:/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/lib/:/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/lib/libjfuselib.dylib"
-#define CLASSPATH "./:/Users/meloam/ReddNetAdaptor/BastardFS/src::/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/jFUSE.jar:/Users/meloam/ReddNetAdaptor/lsync/target/lsync-0.0.1-SNAPSHOT.jar:/Users/meloam/ReddNetAdaptor/lStore/client/target/client-1.0.jar:/Users/meloam/ReddNetAdaptor/BastardFS/edu/vanderbilt/accre/bastardfs/bastardfs.jar"
+#define LIBPATH   "./:/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/lib/:/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/lib/libjfuselib.dylib:/home/meloam/bfs-jars/lib"
+#define CLASSPATH "./:/Users/meloam/ReddNetAdaptor/BastardFS/src::/Users/meloam/ReddNetAdaptor/jFUSE-ll/jFUSE-ll/src/jFUSE/lowlevel/jFUSE.jar:/Users/meloam/ReddNetAdaptor/lsync/target/lsync-0.0.1-SNAPSHOT.jar:/Users/meloam/ReddNetAdaptor/lStore/client/target/client-1.0.jar:/Users/meloam/ReddNetAdaptor/BastardFS/edu/vanderbilt/accre/bastardfs/bastardfs.jar:/home/meloam/bfs-jars/jars/bastardfs.jar:/home/meloam/bfs-jars/jars/jFUSE.jar:/home/meloam/bfs-jars/jars/lsync-0.0.2-SNAPSHOT.jar:/home/meloam/bfs-jars/jars/lib/"
 // /Users/meloam/ReddNetAdaptor/BastardFS/src/bastardfs/bastardfs.jar:
 //
 // Forward declarations
 //
 void * bootstrap_bfs_real( void * arg );
 void * jvm_thread_container( void * arg);
+//#ifdef  __cplusplus
+//extern "C" {
+//#endif
+void terminate_bfs();
+int bootstrap_bfs(const char *, const char *);
 
 //
 // Globals to let us know when to exit
@@ -41,7 +46,9 @@ pthread_mutex_t ops_mutex   = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t ops_cv       = PTHREAD_COND_INITIALIZER;
 const struct fuse_lowlevel_ops *op_table = NULL;
 
-//
+// global handle to the JVM. there can only be one
+static JavaVM          *jvm     = NULL;
+
 // linked list to keep track of fds we may need to destroy
 // TODO: Ugh, I don't want to do this
 
@@ -68,7 +75,7 @@ void terminate_bfs() {
 	pthread_cond_broadcast(&count_cv);
 	pthread_mutex_unlock(&count_mutex);
 	printf("BastardFS: Waiting on JVM shutdown\n");
-	pthread_join(jvm_thread_handle, NULL);
+	pthread_join(bfs_thread_handle, NULL);
 	printf("BastardFS: JVM has returned\n");
 }
 
@@ -102,6 +109,21 @@ int bootstrap_bfs( const char * libpath, const char * classpath ) {
 				return -1;
 			}
 		}
+		/*
+		 * Wait on the jvm to start
+		 */
+		pthread_mutex_lock(&jvm_mutex);
+		while ( (retval = pthread_cond_wait(&jvm_cv, &jvm_mutex)) ) {
+				if (retval) {
+					// some sort of error
+					terminate_bfs();
+					return NULL;
+				}
+				if (jvm_started == 1) {
+					break;
+				}
+		}
+		pthread_mutex_unlock(&jvm_mutex);
 		/* Now that the JVM's started, start a new helper thread
 		 * to hold BFS
 		 */
@@ -124,9 +146,9 @@ int bootstrap_bfs( const char * libpath, const char * classpath ) {
 void * jvm_thread_container( void * arg ) {
 	// Where the JVM will be run permenantly
 	/* Declarations */
-	static JavaVM 		   *jvm		= NULL;
+//	static JavaVM 		   *jvm		= NULL;
 	static JNIEnv		   *env		= NULL;
-	JavaVMOption   options[4];
+	JavaVMOption   options[5];
 	JavaVMInitArgs vm_args;
 	jclass 		   mainClass = NULL;
 	jmethodID 	   mainMethod = NULL;
@@ -139,49 +161,11 @@ void * jvm_thread_container( void * arg ) {
 	options[1].optionString = "-Djava.class.path=" CLASSPATH;
 	options[2].optionString = "-Xdebug";
 	options[3].optionString = "-Xrunjdwp:transport=dt_socket,address=3408,server=y,suspend=n";
-#if 0
-	size_t libpath_length, classpath_length;
-	int currOption = 0;
-
-	/* First, libpath */
-	const char * libpath_prefix = "-Djava.library.path=";
-	libpath_length = strlen( libpath_prefix ) + strlen( libpath ) + 1;
-	char * libpath_option = (char *) malloc( libpath_length );
-	if (libpath_option == NULL) {
-		perror("Error in malloc()");
-		return -1;
-	}
-	strlcpy( libpath_option, libpath_prefix, strlen( libpath_prefix ) + 1 );
-	strlcpy( libpath_option + strlen(libpath_prefix),
-				libpath, strlen( libpath ) + 1);
-	if ( strlen( libpath ) ) {
-		options[currOption].optionString = libpath_option;
-		currOption++;
-	}
-
-	/* Now, classpath */
-	const char * classpath_prefix = "-Djava.class.path=";
-	classpath_length = strlen( classpath_prefix ) + strlen( classpath ) + 1;
-	char * classpath_option = (char *) malloc( classpath_length );
-	if (classpath_option == NULL) {
-		perror("Error in malloc()");
-		return -1;
-	}
-
-	strlcpy( classpath_option, classpath_prefix, strlen( classpath_prefix ) + 1 );
-	strlcpy( classpath_option + strlen(classpath_prefix),
-				classpath, strlen( classpath ) + 1);
-
-	if ( strlen( classpath ) ) {
-		options[currOption].optionString = classpath_option;
-		currOption++;
-	}
-#endif
-
+	options[4].optionString = "-Xcheck:jni"; 
 	/* Builds the args */
 	vm_args.version = 0x00010002;
 	vm_args.options = options;
-	vm_args.nOptions = 4;
+	vm_args.nOptions = 5;
 	vm_args.ignoreUnrecognized = JNI_TRUE;
 
 
@@ -192,8 +176,10 @@ void * jvm_thread_container( void * arg ) {
 		printf("Unable to start Java VM: %i\n", error_code	);
 		goto ERROR_HANDLER;
 	}
+	pthread_mutex_lock( &jvm_mutex );
 	jvm_started = 1;
-
+	pthread_cond_broadcast( &jvm_cv );
+	pthread_mutex_unlock( &jvm_mutex );
 	return NULL;
 
 	/* Error handler */
@@ -221,7 +207,7 @@ void * jvm_thread_container( void * arg ) {
 
 void * bootstrap_bfs_real( void * arg ) {
 	/* Declarations */
-	static JavaVM 		   *jvm		= NULL;
+//	static JavaVM 		   *jvm		= NULL;
 	static JNIEnv		   *env		= NULL;
 	JavaVMOption   options[4];
 	JavaVMInitArgs vm_args;
@@ -272,9 +258,9 @@ void * bootstrap_bfs_real( void * arg ) {
 	(*env)->SetObjectArrayElement(env, args, 2,
 			(*env)->NewStringUTF(env, "--configfile"));
 	(*env)->SetObjectArrayElement(env, args, 3,
-			(*env)->NewStringUTF(env, "bastardfs.properties"));
+			(*env)->NewStringUTF(env, "/home/meloam/bfs-jars/bastardfs.properties"));
 	(*env)->SetObjectArrayElement(env, args, 4,
-			(*env)->NewStringUTF(env, "lstore-gpfs.vampire:/melo-test"));
+			(*env)->NewStringUTF(env, "cms-lstore.vampire:/import"));
 	(*env)->SetObjectArrayElement(env, args, 5,
 			(*env)->NewStringUTF(env, "tmp"));
 
@@ -362,16 +348,14 @@ const struct fuse_lowlevel_ops * get_op_table() {
 
 // replies w/payload
 int send_response_with_payload( fuse_req_t req, response_t * res, const char * buf , size_t size ) {
-	res->buffer_length = size;
+	printf("Got a payload of size %i\n", size);
+	int64_t target_length = ((request_t*) req)->target_size;
+	target_length = (target_length < size) ? target_length : size;
+	memcpy( ((request_t*) req)->target, buf, target_length );
+	res->buffer_length = target_length;
 	ssize_t bytes_written = write( ((request_t* ) req)->fd[1], (char *) res, sizeof(response_t));
 	if ( bytes_written != sizeof(response_t) ) {
 		return -1;
-	}
-	if ( buf != NULL ) {
-		bytes_written = write( ((request_t*) req)->fd[1], buf, size) ;
-		if ( bytes_written != size ) {
-			return errno;
-		}
 	}
 	return 0;
 }
@@ -396,8 +380,6 @@ int fuse_reply_open	(	fuse_req_t 	req,const struct fuse_file_info * 	fi) {
 	return send_response( req, &res );
 }
 int fuse_reply_err	(	fuse_req_t 	req, int 	err	 ) {
-	printf( "Hit fusre_reply_error\n");
-	printf( "Error number is %i\n", err);
 	response_t res;
 	res.error_number = err;
 	res.is_error = 1;
